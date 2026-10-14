@@ -1,0 +1,18 @@
+# Python environments and generated files
+.venv/
+venv/
+kali-venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local credentials and runtime data
+.env
+.env.*
+!.env.example
+.bandit_agent/
+passwords.json
+known_hosts
+
+# Local scratch files
+work/
