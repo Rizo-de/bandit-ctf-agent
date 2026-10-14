@@ -4,13 +4,42 @@ Eine Streamlit-App zum geführten Untersuchen der autorisierten OverTheWire-Band
 
 ## Installation auf Kali Linux
 
-Voraussetzungen: Kali Linux mit Python 3, `venv` und Git. Im Terminal:
+Voraussetzungen: Kali Linux mit Internetzugang. Führe die Schritte der Reihe nach aus. Wenn ein Schritt einen Fehler meldet, stoppe dort und behebe ihn, bevor du fortfährst.
+
+### 1. Grundpakete installieren
 
 ```bash
 sudo apt update
-sudo apt install -y git gh python3 python3-venv python3-pip
+sudo apt install -y git wget python3 python3-venv python3-pip
+```
+
+### 2. GitHub CLI installieren
+
+Das Paket `gh` ist nicht in jeder Kali-APT-Konfiguration verfügbar. Richte daher die offizielle GitHub-CLI-Paketquelle ein:
+
+```bash
+sudo mkdir -p -m 755 /etc/apt/keyrings
+wget -nv -O /tmp/githubcli-archive-keyring.gpg https://cli.github.com/packages/githubcli-archive-keyring.gpg
+sudo install -o root -g root -m 644 /tmp/githubcli-archive-keyring.gpg /etc/apt/keyrings/githubcli-archive-keyring.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+sudo apt update
+sudo apt install -y gh
+```
+
+Prüfe die Installation und melde dich an. Bei privatem Repo muss das GitHub-Konto Zugriff auf `Rizo-de/bandit-ctf-agent` haben:
+
+```bash
+gh --version
 gh auth login --hostname github.com --git-protocol https --web
 gh auth status
+```
+
+### 3. Projekt laden und starten
+
+Starte im Download-Ordner und führe diese Befehle erst aus, nachdem `gh auth status` erfolgreich war:
+
+```bash
+cd ~/Downloads
 gh repo clone Rizo-de/bandit-ctf-agent
 cd bandit-ctf-agent
 python3 -m venv .venv
