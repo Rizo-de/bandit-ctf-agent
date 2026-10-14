@@ -8,8 +8,10 @@ Voraussetzungen: Kali Linux mit Python 3, `venv` und Git. Im Terminal:
 
 ```bash
 sudo apt update
-sudo apt install -y git python3 python3-venv python3-pip
-git clone https://github.com/Rizo-de/bandit-ctf-agent.git
+sudo apt install -y git gh python3 python3-venv python3-pip
+gh auth login --hostname github.com --git-protocol https --web
+gh auth status
+gh repo clone Rizo-de/bandit-ctf-agent
 cd bandit-ctf-agent
 python3 -m venv .venv
 source .venv/bin/activate
