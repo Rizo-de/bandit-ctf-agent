@@ -13,6 +13,18 @@ def test_validate_command_accepts_safe_read_only_command():
     assert normalized == "cat ./readme"
 
 
+def test_validate_command_accepts_grouped_safe_ls_flags():
+    ok, normalized = validate_command("ls -la")
+    assert ok is True
+    assert normalized == "ls -la"
+
+
+def test_validate_command_rejects_grouped_ls_flags_with_unapproved_character():
+    ok, reason = validate_command("ls -laZ")
+    assert ok is False
+    assert "option" in reason.lower()
+
+
 def test_validate_command_rejects_shell_metacharacters():
     ok, reason = validate_command("ls -la && cat secret")
     assert ok is False

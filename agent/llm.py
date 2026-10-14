@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Optional, Union
 
 import ollama
@@ -10,6 +12,35 @@ import httpx
 from .models import AgentMemory, LLMDecision
 
 DecisionInput = Union[LLMDecision, dict[str, Any], str]
+
+
+class OpenRouterRateLimitError(RuntimeError):
+    """An OpenRouter 429 response, with a safe retry hint when provided."""
+
+    def __init__(self, retry_after: float | None = None) -> None:
+        self.retry_after = retry_after
+        message = "OpenRouter hat die Anfrage wegen eines Limits abgelehnt (HTTP 429)."
+        if retry_after is not None:
+            message += f" Laut Retry-After mindestens {max(1, round(retry_after))} Sekunden warten."
+        message += " Prüfe danach Limits und verfügbares Guthaben im OpenRouter-Konto."
+        super().__init__(message)
+
+
+def _retry_after_seconds(response: Any) -> float | None:
+    headers = getattr(response, "headers", {}) or {}
+    value = headers.get("Retry-After") or headers.get("retry-after")
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        try:
+            retry_at = parsedate_to_datetime(str(value))
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
 
 
 def get_ollama_content(response: Any) -> str:
@@ -269,20 +300,46 @@ class OpenRouterLLMClient:
                     {"role": "user", "content": prompt},
                 ],
                 "temperature": 0,
-                "max_tokens": 192,
+                "max_completion_tokens": 4096,
             },
             timeout=self.timeout,
         )
-        response.raise_for_status()
-        choices = response.json().get("choices") or []
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 429:
+                raise OpenRouterRateLimitError(
+                    retry_after=_retry_after_seconds(exc.response)
+                ) from exc
+            raise
+        response_data = response.json()
+        choices = response_data.get("choices") or []
         if not choices:
             raise ValueError("OpenRouter hat keine Modellantwort geliefert.")
-        content = (choices[0].get("message") or {}).get("content")
+        choice = choices[0]
+        message = choice.get("message") or {}
+        content = message.get("content")
         if isinstance(content, list):
             content = "".join(
                 str(part.get("text", "")) for part in content if isinstance(part, dict)
             )
         content = str(content or "").strip()
         if not content:
+            finish_reason = choice.get("finish_reason") or "unbekannt"
+            usage = response_data.get("usage") or {}
+            details = [f"finish_reason={finish_reason}"]
+            completion_tokens = usage.get("completion_tokens")
+            if completion_tokens is not None:
+                details.append(f"completion_tokens={completion_tokens}")
+            completion_details = usage.get("completion_tokens_details") or {}
+            reasoning_tokens = completion_details.get("reasoning_tokens")
+            if reasoning_tokens is not None:
+                details.append(f"reasoning_tokens={reasoning_tokens}")
+            if finish_reason == "length":
+                raise ValueError(
+                    "OpenRouter hat das Antwortlimit erreicht, bevor sichtbarer Text kam ("
+                    + ", ".join(details)
+                    + "). Erhöhe das Antwortlimit oder verwende ein Modell mit weniger Reasoning."
+                )
             raise ValueError("OpenRouter hat eine leere Modellantwort geliefert.")
         return parse_llm_decision(content)

@@ -16,6 +16,11 @@ BLOCKED_TOKENS = (
 
 DANGEROUS_FIND_OPTIONS = {"-exec", "-execdir", "-delete", "-ok", "-okdir"}
 MAX_COMMAND_LENGTH = 500
+LS_SHORT_OPTIONS = frozenset({"a", "A", "l", "h", "R", "t", "r", "S", "d", "F", "1"})
+LS_LONG_OPTIONS = frozenset({
+    "--all", "--almost-all", "--long", "--human-readable", "--recursive",
+    "--directory",
+})
 
 
 def normalize_command(command: str) -> str:
@@ -57,6 +62,37 @@ def _has_output_file_argument(program: str, parts: Sequence[str]) -> bool:
     return False
 
 
+def _validate_ls_options(args: Sequence[str]) -> bool:
+    for arg in args:
+        if not arg.startswith("-"):
+            continue
+        if arg.startswith("--"):
+            if arg not in LS_LONG_OPTIONS:
+                return False
+            continue
+        # ls supports grouped short flags (for example, -la). Accept a group
+        # only when every character is individually approved above.
+        if len(arg) < 2 or any(flag not in LS_SHORT_OPTIONS for flag in arg[1:]):
+            return False
+    return True
+
+
+def describe_command_policy() -> str:
+    """Return the active command rules for the model's decision prompt."""
+    short_flags = ", ".join(f"-{flag}" for flag in sorted(LS_SHORT_OPTIONS))
+    long_flags = ", ".join(sorted(LS_LONG_OPTIONS))
+    return (
+        "Aktuelle zentrale Befehlsfreigabe: erlaubte Programme: "
+        + ", ".join(sorted(ALLOWED_COMMANDS))
+        + ". Nur lesende Befehle; Shell-Verknüpfungen, Umleitungen und Substitutionen sind gesperrt. "
+        + f"Für ls sind kurze Optionen {short_flags} und lange Optionen {long_flags} erlaubt; "
+        + "kurze ls-Optionen dürfen kombiniert werden, wenn jedes Zeichen einzeln freigegeben ist "
+        + "(zum Beispiel -la). Unbekannte Optionen sind gesperrt. find darf keine -exec-, "
+        + "-delete- oder -ok-Aktionen verwenden. Kompressionsbefehle müssen sicher nach stdout ausgeben. "
+        + "Ein Befehl muss zu einer tatsächlichen Level-Beobachtung passen; Dateinamen nicht erfinden."
+    )
+
+
 def _validate_options(program: str, args: Sequence[str]) -> bool:
     """Reject option forms that can change files, spawn tools, or escape scope."""
     # Long options which invoke external commands, write output, or alter state
@@ -68,7 +104,7 @@ def _validate_options(program: str, args: Sequence[str]) -> bool:
         allowed_actions = {"-name", "-iname", "-type", "-size", "-user", "-group", "-perm", "-maxdepth", "-mindepth", "-ls", "-print", "-print0", "-inum", "-mtime", "-atime", "-ctime", "-newer", "-readable", "-writable", "-empty"}
         return all(not arg.startswith("-") or arg in allowed_actions or arg in {"!", "-o", "-a", "(" , ")"} for arg in args)
     if program in {"ls"}:
-        return all(not arg.startswith("-") or arg in {"-a", "-A", "-l", "-h", "-R", "-t", "-r", "-S", "-d", "-F", "-1", "--all", "--almost-all", "--long", "--human-readable", "--recursive", "--directory"} for arg in args)
+        return _validate_ls_options(args)
     if program in {"cat", "head", "tail", "grep", "strings", "file", "wc", "sort", "uniq", "du", "stat", "xxd", "od", "base64", "tr", "cut", "gzip", "bzip2", "xz", "pwd", "whoami", "id", "date", "cd", "man", "help"}:
         # Allow known read-only flags; reject command execution and output paths.
         allowed = {

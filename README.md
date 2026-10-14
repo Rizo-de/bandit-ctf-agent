@@ -1,82 +1,129 @@
 # Bandit CTF Lern-Agent
 
-Eine Streamlit-App zum geführten Untersuchen der autorisierten OverTheWire-Bandit-Level. Der Agent zeigt seine Hypothesen und Befehle an; Befehle unterliegen einer Lesebefehls-Prüfung und können vor der Ausführung freigegeben werden. Ein Level gilt erst nach erfolgreichem SSH-Login beim nächsten Level als gelöst.
+Eine lokal auf deiner Kali-VM laufende Streamlit-App zum geführten Untersuchen der autorisierten OverTheWire-Bandit-Level. Die App verbindet sich von deiner VM aus per verschlüsseltem SSH mit Bandit. Sie lehnt unbekannte oder geänderte SSH-Hostschlüssel ab und speichert einen neuen Schlüssel erst nach deiner ausdrücklichen Bestätigung.
 
-## Installation auf Kali Linux
+## Voraussetzungen
 
-Voraussetzungen: Kali Linux mit Internetzugang. Führe die Schritte der Reihe nach aus. Wenn ein Schritt einen Fehler meldet, stoppe dort und behebe ihn, bevor du fortfährst.
+- Kali Linux mit Internetzugang
+- Python 3.10 bis 3.14 und Git
+- Für die KI-Funktion entweder ein laufender Ollama-Dienst mit heruntergeladenem Modell oder ein OpenRouter-Konto mit API-Schlüssel
 
-### 1. Grundpakete installieren
+Führe Installationsbefehle in einem **Kali-Terminal** aus. Wenn ein Befehl einen Fehler meldet, stoppe dort und behebe ihn, bevor du fortfährst. Verwende `sudo` nur für APT-Pakete, niemals für `pip`.
+
+## 1. Installation
+
+### Systempakete
 
 ```bash
 sudo apt update
-sudo apt install -y git wget python3 python3-venv python3-pip
+sudo apt install -y git python3 python3-venv python3-pip
 ```
 
-### 2. GitHub CLI installieren
-
-Das Paket `gh` ist nicht in jeder Kali-APT-Konfiguration verfügbar. Richte daher die offizielle GitHub-CLI-Paketquelle ein:
+Prüfe die Python-Version:
 
 ```bash
-sudo mkdir -p -m 755 /etc/apt/keyrings
-wget -nv -O /tmp/githubcli-archive-keyring.gpg https://cli.github.com/packages/githubcli-archive-keyring.gpg
-sudo install -o root -g root -m 644 /tmp/githubcli-archive-keyring.gpg /etc/apt/keyrings/githubcli-archive-keyring.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-sudo apt update
-sudo apt install -y gh
+python3 --version
 ```
 
-Prüfe die Installation und melde dich an. Bei privatem Repo muss das GitHub-Konto Zugriff auf `Rizo-de/bandit-ctf-agent` haben:
+### Repository laden
 
-```bash
-gh --version
-gh auth login --hostname github.com --git-protocol https --web
-gh auth status
-```
-
-### 3. Projekt laden und starten
-
-Starte im Download-Ordner und führe diese Befehle erst aus, nachdem `gh auth status` erfolgreich war:
+Das Repository ist öffentlich; `gh` und eine GitHub-Anmeldung sind zum Herunterladen nicht nötig. Klone es im Kali-Terminal:
 
 ```bash
 cd ~/Downloads
-gh repo clone Rizo-de/bandit-ctf-agent
+git clone https://github.com/Rizo-de/bandit-ctf-agent.git
 cd bandit-ctf-agent
+```
+
+Falls das Repository später privat wird, brauchst du Zugriff mit deinem GitHub-Konto. Mit installierter GitHub CLI kannst du dich ohne Token in der Befehlszeile über den Browser anmelden und danach HTTPS verwenden:
+
+```bash
+gh auth login --hostname github.com --git-protocol https --web
+gh auth setup-git
+git clone https://github.com/Rizo-de/bandit-ctf-agent.git
+```
+
+`gh` fehlt möglicherweise in deiner Kali-APT-Konfiguration; installiere es nur nach der offiziellen GitHub-Anleitung: [GitHub CLI installieren](https://github.com/cli/cli/blob/trunk/docs/install_linux.md). Alternativ kannst du einen bereits eingerichteten GitHub-SSH-Schlüssel verwenden. Gib niemals einen Token oder ein Passwort in die Clone-URL, den Quellcode oder eine eingecheckte Datei ein.
+
+Falls der Ordner `~/Downloads/bandit-ctf-agent` bereits existiert, klone nicht erneut. Öffne stattdessen im Kali-Terminal den vorhandenen Ordner:
+
+```bash
+cd ~/Downloads/bandit-ctf-agent
+```
+
+### Virtuelle Umgebung und Python-Abhängigkeiten
+
+Führe die folgenden Befehle im Projektordner `~/Downloads/bandit-ctf-agent` aus:
+
+```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+```
+
+Nach der Aktivierung sollte `(.venv)` am Anfang der Terminal-Eingabezeile erscheinen. Die Abhängigkeiten werden ausschließlich in dieser virtuellen Umgebung installiert. Bei einem Fehler beim Erstellen von `.venv` prüfe, dass `python3-venv` installiert ist.
+
+## 2. App starten
+
+Im Kali-Terminal, im Projektordner:
+
+```bash
+cd ~/Downloads/bandit-ctf-agent
+source .venv/bin/activate
 python -m streamlit run app.py
 ```
 
-Öffne anschließend die von Streamlit angezeigte lokale Adresse (standardmäßig `http://localhost:8501`) im Browser der Kali-VM. Das Terminal mit Streamlit muss geöffnet bleiben. Beenden mit `Ctrl+C`.
+Öffne die von Streamlit angezeigte Adresse, normalerweise `http://localhost:8501`, im Browser **innerhalb derselben Kali-VM**. Lass das Terminal geöffnet, solange du die App verwendest. Beende sie mit `Ctrl+C`.
 
-Wenn du die Seite von einem anderen Rechner im privaten VM-Netz öffnen möchtest, starte stattdessen mit:
+Die App ist für die lokale Nutzung auf der Kali-VM gedacht. Binde sie nicht an `0.0.0.0`, wenn du sie nicht ausdrücklich in einem vertrauenswürdigen Netzwerk bereitstellen willst.
+
+## 3. KI-Verbindung konfigurieren
+
+Wähle links in der App eine der beiden Optionen:
+
+- **Ollama (lokal):** Ollama muss separat installiert und gestartet sein; das Python-Paket in `requirements.txt` ist nur der Ollama-Client. Lade in Ollama eines der angebotenen Modelle herunter (`llama3`, `codellama` oder `mistral`). Verwende `http://localhost:11434`, wenn Ollama auf derselben Kali-VM läuft. Wenn Ollama auf einem anderen Rechner läuft, trage dessen aus Kali erreichbare Adresse ein. Installationshinweise stehen in der [offiziellen Ollama-Dokumentation](https://docs.ollama.com/).
+- **OpenRouter API:** Trage den API-Schlüssel in das maskierte Schlüsselfeld und eine Modell-ID im Format `anbieter/modell` ein. Nutze **„KI-Verbindung und Modell prüfen“**. Der Schlüssel gehört nicht in den Quellcode, eine URL oder eine eingecheckte Datei. Prompts und Befehlsausgaben werden an OpenRouter gesendet; API-Nutzung kann Kosten verursachen.
+
+### OpenRouter-Modelle auswählen
+
+Die folgenden Beispiele wurden am **14. Oktober 2026** anhand der OpenRouter-Modellseiten geprüft. Verfügbarkeit, Preis, Limits und Modellversionen können sich ändern. Prüfe vor der Nutzung die jeweils aktuelle Modellseite und wähle dort eine verfügbare Variante:
+
+| Zweck | Modell-ID | Hinweise |
+|---|---|---|
+| Kostenloser Einstieg | `cohere/north-mini-code:free` | Für Code- und Terminalaufgaben ausgelegt. Kostenfrei laut OpenRouter-Modellseite, aber kostenlose Anbieter können begrenzte Kapazität und Rate-Limits haben. |
+| Mehr Leistung für schwierige Agentenschritte | `xiaomi/mimo-v2.5` | OpenRouter beschreibt es als leistungsfähiges agentisches Modell; die Modellseite nennt außerdem Unterstützung für strukturierte Ausgaben. Kostenpflichtig; die tatsächlichen Kosten hängen vom Anbieter ab. |
+| Schnelle, leichtere Aufgaben | `openai/gpt-5.6-luna` | OpenRouter positioniert es für schnelle, kosteneffiziente und latenzempfindliche Aufgaben. |
+| Aufwendige Programmier- und Agentenaufgaben | `xiaomi/mimo-v2.5-pro` | Xiaomis Flaggschiffmodell für komplexe agentische und Softwareentwicklungs-Aufgaben; Kostenpflichtig. |
+
+Für diesen Bandit-Agenten ist `cohere/north-mini-code:free` ein guter Start ohne Modellkosten. Wenn Antworten wiederholt unvollständig sind, Limits erreicht werden oder der Agent schwach schlussfolgert, teste `xiaomi/mimo-v2.5` als nächsten Schritt. Ein größeres oder teureres Modell löst Rate-Limits nicht automatisch; prüfe dafür zusätzlich dein OpenRouter-Kontingent und die Anbieterverfügbarkeit.
+
+OpenRouter-Links: [alle Modelle und aktuelle Filter](https://openrouter.ai/models), [kostenlose Modelle](https://openrouter.ai/collections/free-models), [Programmiermodelle](https://openrouter.ai/collections/programming), [North Mini Code](https://openrouter.ai/cohere/north-mini-code:free), [MiMo-V2.5](https://openrouter.ai/xiaomi/mimo-v2.5), [GPT-5.6 Luna](https://openrouter.ai/openai/gpt-5.6-luna), [MiMo-V2.5-Pro](https://openrouter.ai/xiaomi/mimo-v2.5-pro).
+
+## 4. SSH-Hostschlüssel beim Erstkontakt bestätigen
+
+Die Bandit-Verbindung verwendet normales verschlüsseltes SSH zu `bandit.labs.overthewire.org` auf Port `2220`. Die offizielle [OverTheWire-Bandit-Seite](https://overthewire.org/wargames/bandit/bandit0.html) nennt Host und Port, veröffentlicht aber keinen Hostschlüssel-Fingerprint. Die App installiert deshalb keinen Fingerprint vor und vertraut einem unbekannten Schlüssel nicht automatisch.
+
+Führe den Erstkontakt in der App aus:
+
+1. Prüfe, dass Host und Port `bandit.labs.overthewire.org` und `2220` lauten.
+2. Klicke **„Bandit-Hostschlüssel-Fingerprint anzeigen“**.
+3. Vergleiche den angezeigten Fingerprint über einen vertrauenswürdigen, unabhängigen Kanal. Ein Community-Write-up ist keine offizielle Bestätigung. Wenn du den Fingerprint nicht unabhängig bestätigen kannst, entscheide bewusst, ob du dem Erstkontakt (TOFU) vertraust; die offizielle Seite stellt keinen Vergleichs-Fingerprint bereit.
+4. Nur wenn du dem angezeigten Schlüssel vertraust, klicke **„Angezeigten Hostschlüssel für Bandit speichern und vertrauen“**. Warte auf **„Hostschlüssel gespeichert“**.
+5. Klicke **„Verbindung prüfen“**.
+
+Der Schlüssel wird in `~/.ssh/known_hosts` des Benutzers gespeichert, unter dem der Streamlit-Prozess läuft. Starte die App und speichere den Schlüssel daher in derselben Kali-VM und mit demselben Benutzerkonto. Ein bereits gespeicherter, abweichender Hostschlüssel wird nicht automatisch gelöscht oder ersetzt; brich in diesem Fall ab und prüfe die Ursache.
+
+Nach erfolgreicher Verbindung trägst du Bandit-Level und Passwort links ein. Die App speichert verifizierte Level-Passwörter lokal im Benutzerverzeichnis. Diese Datei enthält Klartextpasswörter und darf nicht geteilt oder eingecheckt werden.
+
+## Prüfungen für Entwickler
+
+Führe diese Befehle im Projektordner mit aktivierter virtueller Umgebung aus:
 
 ```bash
-python -m streamlit run app.py --server.address 0.0.0.0
-```
-
-Dann nutze im Browser `http://<KALI-VM-IP>:8501`. Öffne den Port nur in einem vertrauenswürdigen privaten Netz.
-
-## KI konfigurieren
-
-- **OpenRouter:** links „OpenRouter API“ wählen, API-Schlüssel und Modell-ID eintragen und mit „KI-Verbindung und Modell prüfen“ testen. Schlüssel nicht in Dateien eintragen oder committen.
-- **Ollama:** links lokale Ollama-Option wählen. Wenn Ollama auf einem anderen Rechner läuft, muss die App dessen erreichbare Adresse verwenden.
-
-Zum Starten eines Bandit-Levels Host `bandit.labs.overthewire.org`, Port `2220`, Benutzer und Passwort eintragen. Beim ersten SSH-Kontakt den Hostkey-Fingerprint anzeigen und nur bei erwartbarem OverTheWire-Erstkontakt vertrauen.
-
-## Tests
-
-```bash
-python -m pip install pytest
 python -m pytest -q
 ```
 
-## Lokale Zugangsdaten
+## Sicherheit und Umfang
 
-Verifizierte Level-Passwörter werden lokal als Klartextdatei gespeichert. Die App zeigt den tatsächlichen Pfad an. Schütze dein Betriebssystemkonto und teile die Datei nicht. `.env`-Dateien, virtuelle Umgebungen, Passwortdateien, SSH-Hostkey-Daten und Laufzeit-Arbeitsdateien sind in `.gitignore` ausgeschlossen.
-
-## Umfang und Sicherheit
-
-Der Agent ist für das OverTheWire-Bandit-Ziel auf Port 2220 eingeschränkt. Es gibt keine Garantie, dass ein LLM immer den richtigen nächsten Schritt findet. Prüfe die vorgeschlagenen Befehle und Ausgaben, bevor du sie freigibst. Verwende das Projekt nur mit Konten und Systemen, für die du autorisiert bist.
+Die App ist für lokale Nutzung mit OverTheWire Bandit vorgesehen. Sie beschränkt SSH auf `bandit.labs.overthewire.org:2220`, prüft den Hostschlüssel und lässt vorgeschlagene Lesebefehle vor der Ausführung prüfen und freigeben. Prüfe die Befehle und Ausgaben trotzdem selbst. Verwende die App nur mit Konten und Systemen, für die du autorisiert bist.

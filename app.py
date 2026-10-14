@@ -18,6 +18,7 @@ from agent import (
 )
 from agent.llm import OllamaLLMClient, get_ollama_content, redact_secrets
 from agent.llm import OpenRouterLLMClient
+from agent.collaboration import build_chat_prompt, chat_answer
 from agent.policy import validate_command as policy_validate_command
 from agent.ssh import BanditSSH
 from agent.host_keys import fetch_bandit_host_key, host_key_fingerprint, save_bandit_host_key
@@ -45,6 +46,10 @@ for key, default in {
     "ssh_status": "Nicht getestet",
     "bandit_host_key_candidate": None,
     "bandit_host_key_fingerprint": "",
+    "chat_history_by_user": {},
+    "agent_hints_by_user": {},
+    "learning_mode": False,
+    "learning_solution_revealed": False,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -184,6 +189,20 @@ if llm_provider == "Ollama (lokal)":
         st.sidebar.info(st.session_state.ollama_autodetect_message)
 max_steps = st.sidebar.slider("Maximale Schritte pro Lauf", 3, 30, 12)
 max_seconds = st.sidebar.slider("Zeitlimit (Sekunden)", 60, 600, 300, step=30)
+learning_mode = st.sidebar.checkbox(
+    "Lernmodus: bis zu 5 sichere Hypothesen vergleichen",
+    key="learning_mode",
+    help="Erzeugt bis zu fünf getrennte KI-Vorschläge pro Schritt und kann bis zu fünf LLM-Aufrufe kosten. Es werden nur geprüfte Befehle zur Freigabe angeboten.",
+)
+if learning_mode and not st.session_state.get("_previous_learning_mode", False):
+    st.session_state.learning_solution_revealed = False
+st.session_state["_previous_learning_mode"] = learning_mode
+if learning_mode:
+    st.sidebar.checkbox(
+        "Lösung / gespeicherte Passwörter einblenden",
+        key="learning_solution_revealed",
+        help="Zeigt Passwörter erst nach deiner ausdrücklichen Zustimmung.",
+    )
 st.sidebar.caption("Bei langsamen lokalen Modellen großzügiger setzen; die Laufzeit zeigt die Ollama-Wartezeit live an.")
 
 ALLOWED = {"pwd", "ls", "cat", "file", "find", "grep", "strings", "head", "tail", "sort", "uniq", "wc", "du", "stat", "xxd", "od", "base64", "tr", "cut", "gzip", "bzip2", "xz", "man", "help", "cd", "whoami", "id", "date"}
@@ -286,9 +305,23 @@ def run_agent_worker(config, report, log, stop_flag):
         report["max_attempts"] = details.get("max_attempts", report.get("max_attempts", config.max_steps))
         report["exit_code"] = details.get("exit_code", report.get("exit_code"))
         report["verification_status"] = details.get("verification_status", report.get("verification_status"))
+        if "reason" in details:
+            report["reason"] = mask_secret(str(details.get("reason") or ""))
+        if "summary" in details:
+            report["decision_summary"] = mask_secret(str(details.get("summary") or ""))
+        if "expected_output" in details:
+            report["expected_output"] = mask_secret(str(details.get("expected_output") or ""))
+        if "candidate_options" in details:
+            report["candidate_options"] = details["candidate_options"]
         if raw_output:
             first_line = mask_secret(str(raw_output).strip().splitlines()[0] if str(raw_output).strip() else "")
             log.append(f"[{report.get('attempt', 0)}] {details.get('last_command') or ''} -> {first_line}")
+        if phase == "decision_ready":
+            log.append(f"[Hypothese] {mask_secret(str(details.get('hypothesis') or ''))}")
+            if details.get("reason"):
+                log.append(f"[Begründung] {mask_secret(str(details['reason']))}")
+            if details.get("expected_output"):
+                log.append(f"[Erwartet] {mask_secret(str(details['expected_output']))}")
 
     try:
         result = BanditAgent(config).run()
@@ -335,6 +368,7 @@ def wait_for_command_approval(command, details, report, log, stop_flag, approval
                 "command_strategy": details.get("strategy", ""),
                 "command_reason": details.get("reason", ""),
                 "expected_output": details.get("expected_output", ""),
+                "candidate_options": details.get("candidate_options", []),
                 "attempt": details.get("step", report.get("attempt", 0)),
                 "max_attempts": details.get("max_attempts", report.get("max_attempts")),
             }
@@ -344,6 +378,7 @@ def wait_for_command_approval(command, details, report, log, stop_flag, approval
 
     event = approval_state["event"]
     approval_state["decision"] = None
+    approval_state["selected_command"] = command
     event.clear()
     report.update(
         {
@@ -357,6 +392,7 @@ def wait_for_command_approval(command, details, report, log, stop_flag, approval
             "command_strategy": details.get("strategy", ""),
             "command_reason": details.get("reason", ""),
             "expected_output": details.get("expected_output", ""),
+            "candidate_options": details.get("candidate_options", []),
             "attempt": details.get("step", report.get("attempt", 0)),
             "max_attempts": details.get("max_attempts", report.get("max_attempts")),
         }
@@ -374,7 +410,11 @@ def wait_for_command_approval(command, details, report, log, stop_flag, approval
             report["phase"] = "command_execute" if approved else "user_solve"
             report["diagnosis"] = "Genehmigter Befehl wird ausgeführt" if approved else "Agent pausiert; du kannst selbst weiterlösen"
             log.append("[Freigabe] Befehl wird ausgeführt." if approved else "[Agent] Befehl nicht ausgeführt; du löst selbst weiter.")
-            return approved
+            if not approved:
+                return False
+            if details.get("candidate_options"):
+                return approval_state.get("selected_command") or command
+            return True
     report["awaiting_approval"] = False
     report["status"] = "NEEDS_INPUT"
     report["approval_message"] = "Freigabezeit abgelaufen; der Befehl wurde nicht ausgeführt."
@@ -569,6 +609,8 @@ if start_clicked and not is_running:
         stop_requested=lambda: worker_stop["value"],
         status_callback=None,
         terminal_log=st.session_state.terminal_log,
+        user_hints=st.session_state.agent_hints_by_user.setdefault(ssh_user, []),
+        learning_mode=learning_mode,
     )
     worker_report = st.session_state.agent_report
     worker_log = st.session_state.agent_log
@@ -587,7 +629,9 @@ if start_clicked and not is_running:
                 "llm_wait": "Warte auf Ollama / LLM-Antwort",
                 "decision_ready": "LLM-Vorschlag ausgewertet",
                 "command_ready": "Befehl vorbereitet; Freigabe folgt",
+                "command_rejected": "Vorschlag durch die Befehlsrichtlinie abgelehnt",
                 "llm_error": "Ollama/LLM-Fehler; Wiederholungsversuch oder Abbruch wird ausgewertet",
+                "llm_rate_limited": "OpenRouter-Limit erreicht; Agent wartet auf Kontingent oder Guthaben",
             }
             label = phase_labels.get(phase, phase)
             worker_report["diagnosis"] = label
@@ -605,6 +649,8 @@ if start_clicked and not is_running:
         worker_report["verification_status"] = details.get(
             "verification_status", worker_report.get("verification_status")
         )
+        if "candidate_options" in details:
+            worker_report["candidate_options"] = details["candidate_options"]
         if details.get("output") and not details.get("phase"):
             worker_report["diagnosis"] = mask_secret(str(details["output"]).strip().splitlines()[0][:240])
         if details.get("llm_duration") is not None:
@@ -615,6 +661,18 @@ if start_clicked and not is_running:
                 str(raw_output).strip().splitlines()[0] if str(raw_output).strip() else ""
             )
             worker_log.append(f"[{time.strftime('%H:%M:%S')}] [{worker_report.get('attempt', 0)}] {details.get('last_command') or 'LLM'} -> {first_line}")
+        if details.get("reason"):
+            worker_report["reason"] = mask_secret(str(details["reason"]))
+        if details.get("expected_output"):
+            worker_report["expected_output"] = mask_secret(str(details["expected_output"]))
+        if phase == "decision_ready":
+            worker_log.append(
+                f"[Hypothese] {mask_secret(str(details.get('hypothesis') or ''))}"
+            )
+            if details.get("reason"):
+                worker_log.append(f"[Begründung] {mask_secret(str(details['reason']))}")
+            if details.get("expected_output"):
+                worker_log.append(f"[Erwartet] {mask_secret(str(details['expected_output']))}")
 
     config.status_callback = _cb
     config.command_approval = lambda command, details: wait_for_command_approval(
@@ -646,6 +704,8 @@ if is_running or st.session_state.agent_thread is not None:
             "llm_wait": "🧠 Ollama/LLM verarbeitet gerade die Level-Informationen …",
             "decision_ready": "✅ LLM-Vorschlag liegt vor; Sicherheitsprüfung läuft …",
             "command_ready": "⌛ Befehl ist vorbereitet …",
+            "command_rejected": "⛔ Befehl wurde abgelehnt und nicht ausgeführt …",
+            "llm_rate_limited": "⚠️ OpenRouter-Limit erreicht. Bitte warte und prüfe Limits/Guthaben im OpenRouter-Konto.",
         "llm_error": "⚠️ Ollama/LLM-Fehler; der Agent wertet einen Wiederholungsversuch aus …",
         "waiting_approval": "🧩 Befehl wartet auf deine Freigabe oder deinen eigenen Lösungsversuch …",
         "command_execute": "▶ Genehmigter Befehl wird ausgeführt …",
@@ -666,6 +726,10 @@ if is_running or st.session_state.agent_thread is not None:
             st.metric("Letzter Exit-Code", report.get("exit_code", ""))
             st.metric("Letzter Befehl", report.get("last_command", "") or "-")
         st.text_area("Aktuelle Hypothese", report.get("hypothesis", ""), height=90, disabled=True)
+        if report.get("reason"):
+            st.write(f"**Begründung:** {report['reason']}")
+        if report.get("decision_summary"):
+            st.info(f"**Abgleich mit bisherigen Beobachtungen:** {report['decision_summary']}")
         if report.get("proposed_command"):
             st.markdown("### Command-Panel · LLM-Vorschlag")
             st.caption("Das zeigt die kurze Begründung des Modells, keine verborgene Gedankenkette.")
@@ -677,31 +741,64 @@ if is_running or st.session_state.agent_thread is not None:
             st.code(report["proposed_command"], language="bash")
             if report.get("expected_output"):
                 st.caption(f"Erwartete Ausgabe: {report['expected_output']}")
+            if report.get("candidate_options") and learning_mode:
+                with st.expander("Lernmodus: geprüfte Hypothesen für diesen Schritt", expanded=True):
+                    for option in report["candidate_options"]:
+                        st.markdown(f"**Option {option['number']}:** {option['hypothesis'] or 'Hypothese fehlt'}")
+                        st.caption(f"Befehl: {option['command']} · Erwartet: {option['expected_output'] or 'keine Angabe'}")
+                        if option.get("reason"):
+                            st.caption(f"Begründung: {option['reason']}")
             if report.get("awaiting_approval"):
-                st.warning("Der Befehl wurde noch nicht ausgeführt. Du kannst nur diesen Befehl oder den gesamten aktuellen Lauf freigeben.")
-                approve_col, approve_all_col, solve_col = st.columns(3)
-                with approve_col:
-                    if st.button("▶ Diesen Befehl ausführen", key="approve_llm_command", type="primary"):
-                        approval = st.session_state.agent_approval
-                        approval["decision"] = True
-                        approval["event"].set()
-                        st.rerun()
-                with approve_all_col:
-                    if st.button("▶▶ Diesen Lauf freigeben", key="approve_all_llm_commands"):
-                        approval = st.session_state.agent_approval
-                        approval["approve_all"] = True
-                        approval["decision"] = True
-                        approval["event"].set()
-                        st.rerun()
-                with solve_col:
-                    if st.button("🧩 Ich probiere selbst – Agent stoppen", key="decline_llm_command"):
-                        approval = st.session_state.agent_approval
-                        approval["decision"] = False
-                        approval["event"].set()
-                        st.rerun()
+                options = report.get("candidate_options", []) if learning_mode else []
+                if options:
+                    st.warning("Noch kein Befehl wurde ausgeführt. Wähle eine geprüfte Option und gib sie ausdrücklich frei.")
+                    selected_number = st.radio(
+                        "Welche Hypothese soll geprüft werden?",
+                        range(len(options)),
+                        format_func=lambda index: f"Option {options[index]['number']}: {options[index]['hypothesis']} · {options[index]['command']}",
+                        key=f"learning_choice_{report.get('attempt', 0)}",
+                    )
+                    approve_col, solve_col = st.columns(2)
+                    with approve_col:
+                        if st.button("▶ Ausgewählte Option ausführen", key="approve_learning_command", type="primary"):
+                            approval = st.session_state.agent_approval
+                            approval["selected_command"] = options[selected_number]["command"]
+                            approval["decision"] = True
+                            approval["event"].set()
+                            st.rerun()
+                    with solve_col:
+                        if st.button("🧩 Ich probiere selbst – Agent stoppen", key="decline_learning_command"):
+                            approval = st.session_state.agent_approval
+                            approval["decision"] = False
+                            approval["event"].set()
+                            st.rerun()
+                else:
+                    st.warning("Der Befehl wurde noch nicht ausgeführt. Du kannst nur diesen Befehl oder den gesamten aktuellen Lauf freigeben.")
+                    approve_col, approve_all_col, solve_col = st.columns(3)
+                    with approve_col:
+                        if st.button("▶ Diesen Befehl ausführen", key="approve_llm_command", type="primary"):
+                            approval = st.session_state.agent_approval
+                            approval["decision"] = True
+                            approval["event"].set()
+                            st.rerun()
+                    with approve_all_col:
+                        if st.button("▶▶ Diesen Lauf freigeben", key="approve_all_llm_commands"):
+                            approval = st.session_state.agent_approval
+                            approval["approve_all"] = True
+                            approval["decision"] = True
+                            approval["event"].set()
+                            st.rerun()
+                    with solve_col:
+                        if st.button("🧩 Ich probiere selbst – Agent stoppen", key="decline_llm_command"):
+                            approval = st.session_state.agent_approval
+                            approval["decision"] = False
+                            approval["event"].set()
+                            st.rerun()
             elif report.get("approval_message"):
                 st.info(report["approval_message"])
         st.text_area("Tatsächliche Befehlsausgabe", report.get("output", ""), height=160, disabled=True)
+        if report.get("exit_code") is not None:
+            st.caption(f"Tatsächlicher Exit-Code: {report['exit_code']}")
         st.markdown("### Live-Konsole · neueste Ereignisse zuerst")
         st.code("\n".join((st.session_state.agent_log or [])[-120:]), language="text")
 
@@ -762,8 +859,11 @@ if not st.session_state.agent_running and st.session_state.agent_thread is None:
             st.success(f"Level {report.get('level', ssh_user)} ist gelöst und verifiziert.")
             if next_password:
                 saved_password_path = persist_passwords(st.session_state.bandit_passwords)
-                st.markdown(f"### Zugang für {next_user}")
-                st.code(f"Benutzer: {next_user}\nPasswort: {next_password}", language="text")
+                if not learning_mode or st.session_state.learning_solution_revealed:
+                    st.markdown(f"### Zugang für {next_user}")
+                    st.code(f"Benutzer: {next_user}\nPasswort: {next_password}", language="text")
+                else:
+                    st.info("Die bestätigte Lösung ist im Lernmodus ausgeblendet. Du kannst sie links ausdrücklich einblenden.")
                 if saved_password_path:
                     st.caption(f"Gespeichert unter: {saved_password_path}")
         if st.session_state.get("password_store_error"):
@@ -775,9 +875,66 @@ if not st.session_state.agent_running and st.session_state.agent_thread is None:
         ):
             st.error(report["error"])
         st.text_area("Hypothese", report.get("hypothesis", ""), height=90, disabled=True)
+        if report.get("reason"):
+            st.write(f"**Begründung:** {report['reason']}")
+        if report.get("decision_summary"):
+            st.info(f"**Abgleich mit bisherigen Beobachtungen:** {report['decision_summary']}")
+        if report.get("expected_output"):
+            st.caption(f"**Erwartete Ausgabe:** {report['expected_output']}")
         st.text_area("Ausgabe", report.get("output", ""), height=140, disabled=True)
         st.markdown("### Agent-Konsole · letzter Lauf")
         st.code("\n".join((st.session_state.agent_log or [])[-120:]) or "Noch keine Ereignisse.", language="text")
+
+st.subheader("💬 Gemeinsam mit der KI lösen")
+st.caption("Deine Hinweise bleiben für dieses Level in der Sitzung erhalten. Chat-Vorschläge werden angezeigt, aber nie automatisch ausgeführt.")
+level_chat = st.session_state.chat_history_by_user.setdefault(ssh_user, [])
+for chat_message in level_chat:
+    with st.chat_message(chat_message["role"]):
+        st.markdown(chat_message["content"])
+
+chat_text = st.chat_input("Frage stellen oder einen Hinweis zum aktuellen Level geben")
+if chat_text:
+    chat_secrets = [ssh_password, *st.session_state.bandit_passwords.values()]
+    safe_chat_text = mask_secret(redact_secrets(chat_text, chat_secrets))
+    level_chat.append({"role": "user", "content": safe_chat_text})
+    hints = st.session_state.agent_hints_by_user.setdefault(ssh_user, [])
+    hints.append(safe_chat_text)
+    del hints[:-15]
+    with st.chat_message("user"):
+        st.markdown(safe_chat_text)
+    try:
+        if llm_provider == "OpenRouter API":
+            chat_client = OpenRouterLLMClient(openrouter_api_key, openrouter_model)
+        else:
+            chat_client = OllamaLLMClient(
+                model=local_model,
+                options={"temperature": 0, "num_predict": 192, "num_ctx": 2048},
+                chat_func=create_ollama_client(ollama_url).chat,
+            )
+        chat_prompt = build_chat_prompt(
+            level=ssh_user,
+            goal=f"Finde und verifiziere das Passwort für {ssh_user} durch autorisierte Level-Untersuchung.",
+            terminal_log=(
+                st.session_state.terminal_log
+                + "\n\nLetzte Agentenereignisse:\n"
+                + "\n".join(st.session_state.agent_log[-60:])
+            ),
+            agent_report=st.session_state.agent_report or {},
+            hints=hints,
+            chat_history=level_chat,
+            secrets=chat_secrets,
+        )
+        chat_decision = chat_client.decide(chat_prompt)
+        command_ok = True
+        if chat_decision.command:
+            command_ok, _ = validate_command(chat_decision.command)
+        answer = mask_secret(redact_secrets(chat_answer(chat_decision, command_ok), chat_secrets))
+    except Exception as exc:
+        answer = f"Die KI konnte gerade nicht antworten ({type(exc).__name__}). Prüfe die bestehende KI-Verbindung und versuche es erneut."
+    level_chat.append({"role": "assistant", "content": answer})
+    with st.chat_message("assistant"):
+        st.markdown(answer)
+    st.rerun()
 
 st.subheader("✍️ Manueller Lesebefehl")
 manual_command = st.text_input("Erlaubter Befehl", placeholder="zum Beispiel: ls -la")
@@ -803,9 +960,12 @@ with st.expander("Gespeicherte Level-Passwörter"):
     st.caption(f"Passwort-Datei: {st.session_state.get('password_store_path', PASSWORD_STORE_PATH)}")
     st.caption("Die lokale Datei enthält Passwörter im Klartext. Schütze dein Windows-/WSL-Benutzerkonto.")
     if st.session_state.bandit_passwords:
-        for username, password in sorted(st.session_state.bandit_passwords.items()):
-            st.markdown(f"**{username}**")
-            st.code(password, language="text")
+        if not learning_mode or st.session_state.learning_solution_revealed:
+            for username, password in sorted(st.session_state.bandit_passwords.items()):
+                st.markdown(f"**{username}**")
+                st.code(password, language="text")
+        else:
+            st.info("Passwörter sind im Lernmodus ausgeblendet. Du kannst sie links ausdrücklich einblenden.")
         if st.button("Gespeicherte Level-Passwörter löschen"):
             st.session_state.bandit_passwords.clear()
             persist_passwords({})

@@ -1,4 +1,6 @@
-from agent.llm import OpenRouterLLMClient
+import httpx
+from agent.llm import OpenRouterLLMClient, OpenRouterRateLimitError
+import pytest
 
 
 class FakeResponse:
@@ -29,6 +31,26 @@ def test_openrouter_decide_uses_bearer_key_and_parses_json():
     assert calls[0][0].endswith("/chat/completions")
     assert calls[0][1]["headers"]["Authorization"] == "Bearer test-key"
     assert calls[0][1]["json"]["model"] == "vendor/model"
+    assert calls[0][1]["json"]["max_completion_tokens"] == 4096
+
+
+def test_openrouter_reports_when_reasoning_uses_the_entire_completion_budget():
+    def fake_post(url, **kwargs):
+        return FakeResponse({
+            "choices": [{
+                "finish_reason": "length",
+                "message": {"content": "", "reasoning": "not shown"},
+            }],
+            "usage": {
+                "completion_tokens": 1024,
+                "completion_tokens_details": {"reasoning_tokens": 1024},
+            },
+        })
+
+    client = OpenRouterLLMClient("test-key", "vendor/model", post_func=fake_post)
+
+    with pytest.raises(ValueError, match="finish_reason=length.*reasoning_tokens=1024"):
+        client.decide("level data")
 
 
 def test_openrouter_model_check_uses_model_metadata_endpoint():
@@ -45,3 +67,22 @@ def test_openrouter_model_check_uses_model_metadata_endpoint():
     assert data["name"] == "Example model"
     assert calls[0][0].endswith("/model/vendor/model")
     assert calls[0][1]["headers"]["Authorization"] == "Bearer test-key"
+
+
+def test_openrouter_429_is_reported_with_retry_after_without_response_body():
+    def fake_post(url, **kwargs):
+        request = httpx.Request("POST", url)
+        return httpx.Response(
+            429,
+            headers={"Retry-After": "30"},
+            text="private provider details",
+            request=request,
+        )
+
+    client = OpenRouterLLMClient("test-key", "vendor/model", post_func=fake_post)
+
+    with pytest.raises(OpenRouterRateLimitError, match="mindestens 30 Sekunden") as error:
+        client.decide("level data")
+
+    assert error.value.retry_after == 30
+    assert "private provider details" not in str(error.value)

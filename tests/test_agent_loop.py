@@ -9,6 +9,7 @@ from agent import (
     SSHResult,
     VerificationResult,
 )
+from agent.llm import OpenRouterRateLimitError
 
 
 class FakeSSH:
@@ -103,6 +104,29 @@ def test_agent_performs_multiple_attempts_before_success():
     assert ssh.commands == ["ls", "cat readme"]
     assert result.password == "secretsecretsecretsecretsecretse"
     assert result.verification_status == "verified"
+
+
+def test_agent_stops_after_openrouter_rate_limit_instead_of_repeating_requests():
+    ssh = FakeSSH({})
+    decisions = [OpenRouterRateLimitError(retry_after=30)]
+    config = make_config(decisions, ssh, max_steps=5)
+    events = []
+    config.status_callback = lambda status, details: events.append(details)
+
+    result = BanditAgent(config).run()
+
+    assert result.status == AgentStatus.ERROR
+    assert result.attempts_count == 0
+    assert ssh.commands == []
+    assert "HTTP 429" in result.error
+    assert "30 Sekunden" in result.error
+    assert [event["phase"] for event in events if event.get("phase")] == [
+        "ssh_connect",
+        "llm_wait",
+        "llm_rate_limited",
+    ]
+    assert result.memory is not None
+    assert any(item.name == "llm_rate_limited" for item in result.memory.strategies)
 
 
 def test_agent_reads_a_listed_dash_named_file_unambiguously():
@@ -202,7 +226,68 @@ def test_duplicate_command_is_blocked_after_first_execution():
     assert result.status == AgentStatus.NEEDS_INPUT
     assert ssh.commands == ["ls"]
     assert result.memory is not None
-    assert result.memory.duplicate_count >= 3
+    assert result.memory.duplicate_count == 0
+    assert any(record.name == "duplicate_command_suppressed" for record in result.memory.strategies)
+
+
+def test_rejected_command_and_reason_are_given_to_next_llm_call_and_not_repeated():
+    ssh = FakeSSH({"ls -la": SSHResult(command="ls -la", exit_code=0, stdout="readme")})
+    decisions = [
+        {"strategy": "list", "command": "ls -laZ", "hypothesis": "List files", "reason": "Inspect files"},
+        {"strategy": "list", "command": "ls -laZ", "hypothesis": "List files again", "reason": "retry"},
+        {"strategy": "list", "command": "ls -la", "hypothesis": "Show hidden files", "reason": "The level needs directory inspection"},
+    ]
+    config = make_config(decisions, ssh, max_steps=3)
+    original_llm = config.llm
+    prompts = []
+
+    def capture_prompt(prompt):
+        prompts.append(prompt)
+        return original_llm(prompt)
+
+    config.llm = capture_prompt
+    result = BanditAgent(config).run()
+
+    assert len(prompts) == 3
+    assert "ls -laZ" in prompts[1]
+    assert "Befehle, die von der zentralen Richtlinie abgelehnt wurden" in prompts[1]
+    assert "Diese Option ist nicht für die freigegebenen Nur-Lese-Befehle zugelassen." in prompts[1]
+    assert "Aktuelle zentrale Befehlsfreigabe" in prompts[1]
+    assert "kurze ls-Optionen dürfen kombiniert werden" in prompts[1]
+    assert "zum Beispiel -la" in prompts[1]
+    assert "-la" in prompts[1]
+    assert "ls -laZ" in prompts[2]
+    assert ssh.commands == ["ls -la"]
+    assert result.memory is not None
+    assert result.memory.rejected_commands["ls -laZ"]
+    assert any(record.name == "rejected_command_suppressed" for record in result.memory.strategies)
+
+
+def test_failed_command_output_is_visible_and_repeated_command_is_suppressed():
+    ssh = FakeSSH(
+        {
+            "cat missing": SSHResult(
+                command="cat missing", exit_code=1, stderr="No such file or directory"
+            ),
+            "ls": SSHResult(command="ls", exit_code=0, stdout="readme"),
+        }
+    )
+    decisions = [
+        {"strategy": "read", "command": "cat missing", "hypothesis": "Read file", "reason": "Try file"},
+        {"strategy": "read", "command": "cat missing", "hypothesis": "Read again", "reason": "Retry"},
+        {"strategy": "list", "command": "ls", "hypothesis": "List observed directory", "reason": "Find actual names"},
+    ]
+    config = make_config(decisions, ssh, max_steps=3)
+    original_llm = config.llm
+    prompts = []
+    config.llm = lambda prompt: (prompts.append(prompt), original_llm(prompt))[1]
+
+    result = BanditAgent(config).run()
+
+    assert "Fehlgeschlagene Befehle" in prompts[1]
+    assert "No such file or directory" in prompts[1]
+    assert ssh.commands == ["cat missing", "ls"]
+    assert result.attempts_count == 2
 
 
 def test_repeated_llm_failures_become_error():
@@ -297,3 +382,49 @@ def test_llm_candidate_without_tool_output_is_not_verified():
     assert result.status != AgentStatus.SOLVED
     assert result.password is None
     assert verifier_calls == []
+
+
+def test_learning_mode_offers_only_distinct_safe_candidates_and_executes_selected_one():
+    ssh = FakeSSH({"ls -l": SSHResult(command="ls -l", exit_code=0, stdout="readme" )})
+    decisions = [
+        {"strategy": "inspect", "command": "ls", "hypothesis": "Dateien ansehen", "reason": "Start"},
+        {"strategy": "detail", "command": "ls -l", "hypothesis": "Details ansehen", "reason": "Metadaten vergleichen"},
+        {"strategy": "unsafe", "command": "ls; id", "hypothesis": "unsicher", "reason": "abgelehnt"},
+        {"strategy": "duplicate", "command": "ls -l", "hypothesis": "Doppelung", "reason": "wiederholt"},
+        {"strategy": "other", "command": "pwd", "hypothesis": "Arbeitsordner prüfen", "reason": "Pfad"},
+    ]
+    config = make_config(decisions, ssh, max_steps=1)
+    config.learning_mode = True
+    choices = []
+
+    def approve(command, details):
+        choices.extend(details["candidate_options"])
+        return "ls -l"
+
+    config.command_approval = approve
+    result = BanditAgent(config).run()
+
+    assert [item["command"] for item in choices] == ["ls", "ls -l", "pwd"]
+    assert ssh.commands == ["ls -l"]
+    assert result.attempts_count == 1
+
+
+def test_user_hints_are_included_as_untrusted_data_in_agent_prompt():
+    ssh = FakeSSH({"pwd": SSHResult(command="pwd", exit_code=0, stdout="/home/bandit0")})
+    config = make_config(
+        [{"strategy": "inspect", "command": "pwd", "hypothesis": "Pfad", "reason": "Prüft Ort"}],
+        ssh,
+        max_steps=1,
+    )
+    prompts = []
+
+    def capture_llm(prompt):
+        prompts.append(prompt)
+        return {"strategy": "inspect", "command": "pwd", "hypothesis": "Pfad", "reason": "Prüft Ort"}
+
+    config.llm = capture_llm
+    config.user_hints = ["Die Datei heißt vielleicht -"]
+    BanditAgent(config).run()
+
+    assert "Die Datei heißt vielleicht -" in prompts[0]
+    assert "untrusted observation data" in prompts[0]

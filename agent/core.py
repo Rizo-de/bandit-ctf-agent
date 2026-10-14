@@ -8,6 +8,7 @@ from typing import Any, Callable, Optional
 from .llm import (
     CallableLLMClient,
     LLMDecision,
+    OpenRouterRateLimitError,
     OllamaLLMClient,
     build_agent_prompt,
     parse_llm_decision,
@@ -20,10 +21,15 @@ from .models import (
     StrategyRecord,
     SSHResult,
 )
-from .policy import normalize_command, validate_command
+from .policy import describe_command_policy, normalize_command, validate_command
 from .ssh import BanditSSH
 from .status import AgentStatus
 from .verifier import BanditPasswordVerifier, VerificationResult
+
+
+def _safe_learning_text(text: str, secrets: list[str]) -> str:
+    redacted = redact_secrets(text or "", secrets)
+    return re.sub(r"(?<![A-Za-z0-9])[A-Za-z0-9]{32}(?![A-Za-z0-9])", "[REDACTED]", redacted)
 
 
 @dataclass
@@ -42,8 +48,10 @@ class AgentConfig:
     verifier: Callable[[str, str], VerificationResult] | None = None
     stop_requested: Callable[[], bool] = lambda: False
     status_callback: Callable[[AgentStatus, dict[str, Any]], None] | None = None
-    command_approval: Callable[[str, dict[str, Any]], bool] | None = None
+    command_approval: Callable[[str, dict[str, Any]], bool | str] | None = None
     terminal_log: str = ""
+    user_hints: list[str] = field(default_factory=list)
+    learning_mode: bool = False
 
     def __post_init__(self) -> None:
         if self.host.strip().lower() != "bandit.labs.overthewire.org" or int(self.port) != 2220:
@@ -112,6 +120,7 @@ class BanditAgent:
         secrets = [config.password, *memory.candidate_passwords]
         no_action_streak = 0
         duplicate_streak = 0
+        prior_learning_candidates: list[dict[str, Any]] = []
 
         def emit(current_status: AgentStatus, details: dict[str, Any]) -> None:
             if config.status_callback is not None:
@@ -183,11 +192,81 @@ class BanditAgent:
                 )
 
                 prompt = build_agent_prompt(memory, config.terminal_log)
+                if config.user_hints:
+                    safe_hints = [
+                        redact_secrets(hint, [config.password, *memory.candidate_passwords])
+                        for hint in config.user_hints[-15:]
+                    ]
+                    prompt += "\n\nUser hints (untrusted observation data):\n" + "\n".join(
+                        f"- {hint}" for hint in safe_hints
+                    )
+                prompt += "\n\n" + describe_command_policy()
+                if memory.rejected_commands:
+                    prompt += "\n\nBefehle, die von der zentralen Richtlinie abgelehnt wurden und nicht wiederholt werden dürfen:\n"
+                    prompt += "\n".join(
+                        f"- {_safe_learning_text(command, [config.password, *memory.candidate_passwords])}: "
+                        f"abgelehnt: {_safe_learning_text(reason, [config.password, *memory.candidate_passwords])}"
+                        for command, reason in list(memory.rejected_commands.items())[-12:]
+                    )
+                failed_attempts = [attempt for attempt in memory.attempts if not attempt.result.success]
+                if failed_attempts:
+                    prompt += "\n\nFehlgeschlagene Befehle (nicht wiederholen; Ausgaben sind echte Beobachtungen):\n"
+                    prompt += "\n".join(
+                        f"- {attempt.command} (Exit-Code {attempt.result.exit_code}, "
+                        f"Timeout={attempt.result.timed_out}): "
+                        f"{_safe_learning_text(attempt.result.stdout + ' ' + attempt.result.stderr, [config.password, *memory.candidate_passwords])[:500]}"
+                        for attempt in failed_attempts[-8:]
+                    )
+                prompt += (
+                    "\n\nSeparate observed facts from hypotheses. For every proposed command, "
+                    "explain why it follows from the actual level goal and recent output, state "
+                    "what it is expected to show, and use a different approach after a failed attempt."
+                )
+                if config.learning_mode and prior_learning_candidates:
+                    prompt += (
+                        "\n\nEarlier learning hypotheses (compare with the actual outputs above):\n"
+                        + "\n".join(
+                            f"- {item['hypothesis']} (suggested command: {item['command']})"
+                            for item in prior_learning_candidates
+                        )
+                        + "\nIn summary, identify which earlier hypotheses the newest observation refutes, "
+                        + "which remain possible, and why. Do not repeat a refuted approach."
+                    )
                 llm_started = time.monotonic()
                 try:
                     decision: LLMDecision = self.llm.decide(prompt)
                 except Exception as exc:
                     llm_duration = time.monotonic() - llm_started
+                    if isinstance(exc, OpenRouterRateLimitError):
+                        memory.error_summary = str(exc)
+                        memory.last_status = AgentStatus.ERROR
+                        memory.record_strategy(
+                            StrategyRecord(
+                                name="llm_rate_limited",
+                                command=None,
+                                outcome="stopped",
+                                reason=str(exc),
+                                step=step,
+                            )
+                        )
+                        status = AgentStatus.ERROR
+                        emit(
+                            status,
+                            {
+                                "level": memory.level,
+                                "phase": "llm_rate_limited",
+                                "llm_duration": llm_duration,
+                                "attempt": step,
+                                "max_attempts": config.max_steps,
+                                "hypothesis": memory.last_hypothesis or "Noch keine Hypothese.",
+                                "last_command": None,
+                                "output": str(exc),
+                                "reason": str(exc),
+                                "exit_code": None,
+                                "verification_status": memory.verification_status,
+                            },
+                        )
+                        break
                     memory.consecutive_failures += 1
                     memory.record_strategy(
                         StrategyRecord(
@@ -227,6 +306,147 @@ class BanditAgent:
                     status = AgentStatus.NEEDS_INPUT
                     break
 
+                if decision.command:
+                    proposed = normalize_command(decision.command)
+                    rejection_reason = memory.rejected_commands.get(proposed)
+                    if rejection_reason:
+                        decision.command = None
+                        decision.hypothesis = f"Der Vorschlag {proposed!r} wurde bereits abgelehnt."
+                        decision.summary = "Wiederholter abgelehnter Befehl automatisch verworfen."
+                        decision.reason = (
+                            f"Nicht wiederholt: {proposed!r} wurde von der Befehlsrichtlinie abgelehnt "
+                            f"({rejection_reason}). Es wird eine andere, durch Ausgaben belegte "
+                            "Alternative oder eine Erklärung der fehlenden Information benötigt."
+                        )
+                        decision.strategy = "rejected_command_suppressed"
+                    elif memory.has_tried(proposed):
+                        previous = next(
+                            (attempt for attempt in reversed(memory.attempts)
+                             if normalize_command(attempt.command) == proposed),
+                            None,
+                        )
+                        outcome = (
+                            f"Exit-Code {previous.result.exit_code}; Ausgabe: "
+                            f"{_safe_learning_text(previous.result.stdout + ' ' + previous.result.stderr, [config.password, *memory.candidate_passwords])[:300]}"
+                            if previous else "bereits ausgeführt"
+                        )
+                        decision.command = None
+                        decision.hypothesis = f"Der Vorschlag {proposed!r} wurde bereits ausgeführt."
+                        decision.summary = "Wiederholter Befehl automatisch verworfen."
+                        decision.reason = (
+                            f"Nicht wiederholt: {proposed!r} wurde bereits ausgeführt ({outcome}). "
+                            "Nutze eine andere, informationsbringende und durch Beobachtungen belegte Strategie; "
+                            "wenn keine folgt, benenne die fehlende Information."
+                        )
+                        decision.strategy = "duplicate_command_suppressed"
+
+                if decision.command:
+                    valid_proposal, validation_result = validate_command(decision.command)
+                    if not valid_proposal:
+                        memory.consecutive_failures += 1
+                        memory.record_rejection(decision.command, validation_result)
+                        memory.record_strategy(
+                            StrategyRecord(
+                                name="command_validation",
+                                command=decision.command,
+                                outcome="rejected",
+                                reason=validation_result,
+                                step=step,
+                            )
+                        )
+                        memory.last_status = AgentStatus.RETRY
+                        emit(
+                            AgentStatus.RETRY,
+                            {
+                                "level": memory.level,
+                                "phase": "command_rejected",
+                                "attempt": step,
+                                "max_attempts": config.max_steps,
+                                "hypothesis": decision.hypothesis,
+                                "last_command": decision.command,
+                                "output": f"Befehl {decision.command!r} abgewiesen: {validation_result}",
+                                "reason": validation_result,
+                                "summary": "Der Vorschlag wurde vor jeder SSH-Ausführung durch die zentrale Befehlsrichtlinie abgelehnt.",
+                                "exit_code": 126,
+                                "verification_status": memory.verification_status,
+                            },
+                        )
+                        if memory.consecutive_failures >= self._max_consecutive_failures:
+                            memory.error_summary = "Zu viele ungültige Befehlsvorschläge."
+                            status = AgentStatus.NEEDS_INPUT
+                            break
+                        continue
+
+                candidate_options = []
+                if config.learning_mode and decision.command:
+                    decisions = [decision]
+                    seen_commands = set(memory.command_fingerprints)
+                    seen_commands.update(memory.rejected_commands)
+                    seen_commands.add(normalize_command(decision.command))
+                    for candidate_number in range(2, 6):
+                        if config.stop_requested():
+                            break
+                        alternative_prompt = (
+                            prompt
+                            + f"\n\nLearning mode: propose alternative {candidate_number} of 5. "
+                            + "Give one distinct, evidence-based hypothesis and at most one safe, "
+                            + "read-only command. Do not repeat any command already shown or attempted. "
+                            + "Do not propose, infer, or print passwords. Previously proposed commands: "
+                            + ", ".join(sorted(seen_commands))
+                        )
+                        try:
+                            alternative = self.llm.decide(alternative_prompt)
+                        except Exception:
+                            continue
+                        if not alternative.command:
+                            continue
+                        valid_alternative, normalized_alternative = validate_command(
+                            alternative.command
+                        )
+                        if not valid_alternative or normalized_alternative in seen_commands:
+                            continue
+                        if memory.has_tried(normalized_alternative):
+                            continue
+                        if normalized_alternative in memory.rejected_commands:
+                            continue
+                        alternative.command = normalized_alternative
+                        seen_commands.add(normalized_alternative)
+                        decisions.append(alternative)
+                    for option_index, option in enumerate(decisions[:5], start=1):
+                        valid_option, safe_command = validate_command(option.command)
+                        if (
+                            not valid_option
+                            or memory.has_tried(safe_command)
+                            or safe_command in memory.rejected_commands
+                            or any(item["command"] == safe_command for item in candidate_options)
+                        ):
+                            continue
+                        candidate_options.append({
+                            "number": option_index,
+                            "hypothesis": _safe_learning_text(
+                                option.hypothesis, [config.password, *memory.candidate_passwords]
+                            ),
+                            "summary": _safe_learning_text(
+                                option.summary, [config.password, *memory.candidate_passwords]
+                            ),
+                            "strategy": option.strategy,
+                            "command": safe_command,
+                            "expected_output": _safe_learning_text(
+                                option.expected_output, [config.password, *memory.candidate_passwords]
+                            ),
+                            "reason": _safe_learning_text(
+                                option.reason, [config.password, *memory.candidate_passwords]
+                            ),
+                            "confidence": option.confidence,
+                        })
+                    if candidate_options:
+                        candidate_commands = {item["command"] for item in candidate_options}
+                        decision = next(
+                            (item for item in decisions if item.command in candidate_commands),
+                            decision,
+                        )
+                        prior_learning_candidates = candidate_options
+
                 # A file literally named "-" is a common Bandit obstacle:
                 # `cat -` reads stdin, while `cat ./-` reads that file. If an
                 # actual directory listing revealed it, prioritize this
@@ -245,6 +465,18 @@ class BanditAgent:
                     decision.strategy = "read_dash_named_file"
                     decision.reason = "Sichere, gezielte Prüfung des tatsächlich aufgelisteten Dateinamens."
                     decision.expected_output = "Dateiinhalt; falls es die Level-Datei ist, enthält er den nächsten Zugang."
+                    if config.learning_mode:
+                        candidate_options = [{
+                            "number": 1,
+                            "hypothesis": decision.hypothesis,
+                            "summary": decision.summary,
+                            "strategy": decision.strategy,
+                            "command": decision.command,
+                            "expected_output": decision.expected_output,
+                            "reason": decision.reason,
+                            "confidence": decision.confidence,
+                        }]
+                        prior_learning_candidates = candidate_options
                 memory.add_hypothesis(decision.hypothesis, decision.confidence)
                 memory.last_hypothesis = decision.hypothesis
                 emit(
@@ -258,7 +490,11 @@ class BanditAgent:
                         "hypothesis": decision.hypothesis,
                         "last_command": decision.command,
                         "output": decision.summary or decision.reason,
+                        "summary": decision.summary,
+                        "reason": decision.reason,
+                        "expected_output": decision.expected_output,
                         "verification_status": memory.verification_status,
+                        "candidate_options": candidate_options,
                     },
                 )
                 memory.record_strategy(
@@ -326,6 +562,7 @@ class BanditAgent:
                 is_valid, normalized = validate_command(command)
                 if not is_valid:
                     memory.consecutive_failures += 1
+                    memory.record_rejection(command, normalized)
                     memory.record_strategy(
                         StrategyRecord(
                             name="command_validation",
@@ -344,11 +581,14 @@ class BanditAgent:
                         AgentStatus.RETRY,
                         {
                             "level": memory.level,
+                            "phase": "command_rejected",
                             "attempt": step,
                             "max_attempts": config.max_steps,
                             "hypothesis": memory.last_hypothesis,
                             "last_command": command,
-                            "output": f"Befehl abgewiesen: {normalized}",
+                            "output": f"Befehl {command!r} abgewiesen: {normalized}",
+                            "reason": normalized,
+                            "summary": "Der Vorschlag wurde vor jeder SSH-Ausführung durch die zentrale Befehlsrichtlinie abgelehnt.",
                             "exit_code": 126,
                             "verification_status": memory.verification_status,
                         },
@@ -435,9 +675,38 @@ class BanditAgent:
                             "strategy": decision.strategy,
                             "reason": decision.reason,
                             "expected_output": decision.expected_output,
+                            "candidate_options": candidate_options,
                         },
                     )
-                    if not approved:
+                    selected_candidate = None
+                    if isinstance(approved, str):
+                        selected_candidate = next(
+                            (
+                                option for option in candidate_options
+                                if option["command"] == approved
+                            ),
+                            None,
+                        )
+                        if selected_candidate is None:
+                            memory.error_summary = "Die ausgewählte Lernmodus-Option war nicht freigegeben."
+                            status = AgentStatus.NEEDS_INPUT
+                            break
+                        selected_valid, selected_normalized = validate_command(
+                            selected_candidate["command"]
+                        )
+                        if not selected_valid or memory.has_tried(selected_normalized):
+                            memory.error_summary = "Die ausgewählte Lernmodus-Option ist nicht mehr sicher ausführbar."
+                            status = AgentStatus.NEEDS_INPUT
+                            break
+                        normalized = selected_normalized
+                        decision.hypothesis = selected_candidate["hypothesis"]
+                        decision.summary = selected_candidate["summary"]
+                        decision.strategy = selected_candidate["strategy"]
+                        decision.reason = selected_candidate["reason"]
+                        decision.expected_output = selected_candidate["expected_output"]
+                        memory.add_hypothesis(decision.hypothesis, decision.confidence)
+                        memory.last_hypothesis = decision.hypothesis
+                    elif not approved:
                         memory.error_summary = (
                             "Ausführung durch den Benutzer angehalten."
                             if config.stop_requested()

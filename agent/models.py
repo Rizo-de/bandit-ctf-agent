@@ -77,6 +77,7 @@ class AgentMemory:
     hypotheses: list[str] = field(default_factory=list)
     command_fingerprints: set[str] = field(default_factory=set)
     command_outcomes: dict[str, str] = field(default_factory=dict)
+    rejected_commands: dict[str, str] = field(default_factory=dict)
     tried_candidates: list[str] = field(default_factory=list)
     rejected_candidates: set[str] = field(default_factory=set)
     candidate_passwords: list[str] = field(default_factory=list)
@@ -116,6 +117,10 @@ class AgentMemory:
 
     def record_strategy(self, record: StrategyRecord) -> None:
         self.strategies.append(record)
+
+    def record_rejection(self, command: str, reason: str) -> None:
+        """Remember a policy-rejected command so it is not proposed again."""
+        self.rejected_commands[normalize_command(command)] = reason.strip()
 
     def add_hypothesis(self, text: str, confidence: float = 0.0) -> None:
         cleaned = text.strip()
